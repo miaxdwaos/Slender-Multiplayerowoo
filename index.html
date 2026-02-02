@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Slender 3D - Multijugador (Auto-Reset)</title>
+    <title>Slender 3D - Multijugador Estable</title>
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
     <style>
         body { margin: 0; overflow: hidden; background: #000; font-family: 'Courier New', monospace; touch-action: none; }
@@ -34,7 +34,7 @@
             <button class="btn-join" onclick="connectToHost()">UNIRSE AL JUEGO</button>
         </div>
         <button id="start-btn" class="btn-start" onclick="startGame()">INICIAR PARTIDA</button>
-        <div id="status-msg" style="color: #f1c40f; margin-top: 10px;">Si un jugador sale, el juego se reinicia.</div>
+        <div id="status-msg" style="color: #f1c40f; margin-top: 10px;">Sistema de auto-reinicio activo.</div>
     </div>
 </div>
 
@@ -72,29 +72,38 @@
     const peer = new Peer();
     let myId, hostConn, connections = {}, players = {}, slenderman = { x: 8.5, y: 8.5, active: false };
     let gameStarted = false, notesCollected = 0, isDead = false, maxNotes = 0;
+    
+    // Configuración Heartbeat
+    let lastHeartbeat = {};
+    const HEARTBEAT_INTERVAL = 1000;
+    const TIMEOUT_THRESHOLD = 4000;
 
     peer.on('open', id => {
         myId = id;
         document.getElementById('my-id').innerText = id;
-        players[id] = { x: 1.5, y: 1.5, color: '#3498db', isDead: false, lastSeen: Date.now(), deadX: null, deadY: null };
+        players[id] = { x: 1.5, y: 1.5, color: '#3498db', isDead: false, lastSeen: Date.now() };
         document.getElementById('start-btn').style.display = 'block'; 
     });
 
     peer.on('connection', conn => {
         conn.on('open', () => {
             connections[conn.peer] = conn;
-            players[conn.peer] = { x: 1.5, y: 1.5, color: '#e67e22', isDead: false, lastSeen: Date.now(), deadX: null, deadY: null };
-            addChatMessage("Sistema", "Un amigo se ha unido.");
+            players[conn.peer] = { x: 1.5, y: 1.5, color: '#e67e22', isDead: false };
+            lastHeartbeat[conn.peer] = Date.now();
+            addChatMessage("Sistema", "Jugador conectado.");
             syncToAll();
         });
         conn.on('data', handleData);
-        // ESTO DETECTA SI EL OTRO CIERRA LA PESTAÑA
         conn.on('close', () => removePlayer(conn.peer));
-        conn.on('error', () => removePlayer(conn.peer));
     });
 
     function handleData(data) {
-        if (data.type === 'move') {
+        // Registrar señales de vida
+        if (data.id) lastHeartbeat[data.id] = Date.now();
+
+        if (data.type === 'disconnect') {
+            removePlayer(data.id);
+        } else if (data.type === 'move') {
             if(players[data.id]) {
                 players[data.id].x = data.x;
                 players[data.id].y = data.y;
@@ -107,7 +116,7 @@
             if (!hostConn && worldMap[data.cx][data.cy] === 2) {
                 worldMap[data.cx][data.cy] = 0;
                 notesCollected++;
-                if(notesCollected >= maxNotes) endGame("¡PÁGINAS RECOGIDAS!");
+                if(notesCollected >= maxNotes) endGame("¡VICTORIA!");
                 syncToAll();
             }
         } else if (data.type === 'update') {
@@ -125,18 +134,46 @@
         }
     }
 
-    // ESTA ES LA FUNCIÓN CLAVE QUE REINICIA TODO
+    // El mensaje de "Ya me fui" rápido
+    window.addEventListener('beforeunload', () => {
+        const msg = { type: 'disconnect', id: myId };
+        if (hostConn && hostConn.open) hostConn.send(msg);
+        for (let id in connections) {
+            if (connections[id].open) connections[id].send(msg);
+        }
+    });
+
+    // Envío constante de latidos
+    setInterval(() => {
+        if (Object.keys(players).length > 1) {
+            broadcast({ type: 'heartbeat', id: myId });
+        }
+    }, HEARTBEAT_INTERVAL);
+
+    // Chequeo de tiempos de espera
+    setInterval(() => {
+        const now = Date.now();
+        for (let id in lastHeartbeat) {
+            if (id !== myId && (now - lastHeartbeat[id] > TIMEOUT_THRESHOLD)) {
+                console.log("Jugador perdido por timeout:", id);
+                removePlayer(id);
+            }
+        }
+    }, 2000);
+
     function removePlayer(peerId) {
         if (players[peerId]) {
             delete players[peerId];
-            if (connections[peerId]) delete connections[peerId];
-            
-            // Si estábamos jugando y alguien se desconecta, reiniciamos la página
+            delete lastHeartbeat[peerId];
+            if (connections[peerId]) {
+                connections[peerId].close();
+                delete connections[peerId];
+            }
+            // Si son 2 y uno se sale mientras juegan -> REINICIO AUTOMÁTICO
             if (gameStarted) {
-                alert("Un jugador abandonó. Reiniciando juego...");
+                alert("Un jugador se ha ido. La partida no puede continuar.");
                 location.reload(); 
             } else {
-                addChatMessage("Sistema", "Alguien salió del lobby.");
                 syncToAll();
             }
         }
@@ -154,12 +191,11 @@
             }, 30);
         });
         hostConn.on('data', handleData);
-        // Si el Host cierra, el invitado reinicia
         hostConn.on('close', () => { alert("Host desconectado."); location.reload(); });
     }
 
     function startGame() {
-        if (Object.keys(players).length < 2) return alert("Necesitas al menos 2 jugadores.");
+        if (Object.keys(players).length < 2) return alert("Faltan jugadores.");
         gameStarted = true;
         notesCollected = 0; maxNotes = 0;
         for(let r=0; r<worldMap.length; r++) {
@@ -179,7 +215,6 @@
         if(!hostConn) broadcast({ type: 'update', players, worldMap, slenderman, gameStarted, notesCollected, maxNotes });
     }
 
-    // --- EL RESTO DEL CÓDIGO DE RENDERIZADO Y MOVIMIENTO SE MANTIENE IGUAL ---
     function addChatMessage(sender, text) {
         const div = document.createElement('div');
         const name = sender === myId ? "Tú" : sender.substring(0,4);
@@ -188,6 +223,7 @@
         chatMessages.scrollTop = chatMessages.scrollHeight;
     }
 
+    // --- LÓGICA DE JUEGO (RAYCASTING) ---
     let posX = 1.5, posY = 1.5, dirX = 1, dirY = 0, planeX = 0, planeY = 0.66;
     let moveSpeed = 0.08, mouseSensitivity = 0.003;
 
@@ -251,7 +287,7 @@
         const w = canvas.width, h = canvas.height;
         ctx.fillStyle = "#000"; ctx.fillRect(0, 0, w, h);
         if(!gameStarted && notesCollected === 0) {
-            ctx.fillStyle = "white"; ctx.textAlign = "center"; ctx.fillText("CONECTA A UN AMIGO PARA EMPEZAR", w/2, h/2);
+            ctx.fillStyle = "white"; ctx.textAlign = "center"; ctx.fillText("ESPERANDO JUGADORES...", w/2, h/2);
             requestAnimationFrame(render); return;
         }
 
